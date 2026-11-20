@@ -1,6 +1,6 @@
-name: Build MIUI_cas_ReSukiSU-SuSFS
+name: Build AOSP_cas_ReSukiSU-SuSFS
 
-# 只构建一个目标：MIUI + cas + KSU(BakaSU) + SuSFS
+# 只构建一个目标：AOSP + cas + KSU(BakaSU) + SuSFS
 on:
   workflow_dispatch:
   push:
@@ -24,15 +24,15 @@ env:
   CCACHE_MAXSIZE: 2G
   # Bump the trailing version whenever the compiler or flags change, so stale
   # objects are not reused under a new configuration.
-  CCACHE_KEY: ccache-ecs-cas-miui-v1
+  CCACHE_KEY: ccache-ecs-cas-aosp-v1
   # Past snapshots to keep.  A full kernel cache is ~0.6 GB, so this stays far
   # below the 10 GB per-repository Actions cache quota.
   CCACHE_KEEP: 2
   CLANG_TAG: 16.0.6-20260807
 
 jobs:
-  build-cas-miui:
-    name: Build cas | MIUI | ReSukiSU-SuSFS
+  build-cas-aosp:
+    name: Build cas | AOSP | ReSukiSU-SuSFS
     runs-on: ubuntu-24.04
 
     steps:
@@ -160,7 +160,7 @@ jobs:
         key: ${{ env.CCACHE_KEY }}-${{ github.run_id }}
         restore-keys: |
           ${{ env.CCACHE_KEY }}-
-          ccache-ecs-cas-miui-
+          ccache-ecs-cas-aosp-
           ccache-ecs-
 
     - name: Report ccache state before build
@@ -170,11 +170,11 @@ jobs:
         ccache -o compression=true
         ccache -s
 
-    - name: Run Build Script (cas + ksu + miui)
+    - name: Run Build Script (cas + ksu + aosp)
       run: |
         chmod +x build_kernel.sh
-        echo "Executing command: ./build_kernel.sh cas ksu miui"
-        ./build_kernel.sh cas ksu miui
+        echo "Executing command: ./build_kernel.sh cas ksu aosp"
+        ./build_kernel.sh cas ksu aosp
 
     - name: Report ccache state after build
       if: always()
@@ -356,7 +356,7 @@ jobs:
           printf -v MANAGER_LINE -- '- BakaSU 管理器：%s\n' "${APK_FILES[0]}"
         fi
 
-        NOTES=$(printf 'AnyKernel3 刷机包，可直接刷入，无需解压。\n\n- 内核 release：%s\n%s- 构建提交：%s\n- 构建运行：%s/%s/actions/runs/%s\n' \
+        NOTES=$(printf 'AnyKernel3 刷机包，可直接刷入，无需解压。\n\n- 内核 release：%s\n- 目标系统：AOSP\n%s- 构建提交：%s\n- 构建运行：%s/%s/actions/runs/%s\n' \
           "${KERNEL_RELEASE}" "${MANAGER_LINE}" "${GITHUB_SHA}" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}")
 
         if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
