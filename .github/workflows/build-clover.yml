@@ -1,0 +1,209 @@
+name: Build BakaSU cas (CloverProject base)
+
+# 目标：以 Rve27/android_kernel_xiaomi_sm8250 的 lineage-23.2（4.19.325-cip136-st20）
+# 为基座，套上 cas 的设备配置（kona-perf + sm8250-common + cas），再把最新 BakaSU
+# 编进去。这份基座的配置跟用户手上能在 CloverProject-4.1 上跑起来的那颗 boot
+# 逐项一致（KTZ8866/DUALKTZ8866 背光、BQ25790 充电、MAX77932、MAX28200 等），
+# 因此 DC 调光、马达、霍尔、指示灯都在。
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Kernel branch (Rve27/android_kernel_xiaomi_sm8250)'
+        default: 'lineage-23.2'
+        required: false
+      clang:
+        description: 'AOSP clang tag'
+        default: 'clang-r574158'
+        required: false
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: clover-bakasu
+  cancel-in-progress: false
+
+env:
+  KERNEL_REPO: https://github.com/Rve27/android_kernel_xiaomi_sm8250.git
+  # 用来取 AnyKernel3 外壳（cas 的分区路径、A/B 槽位处理都在里面）
+  AK3_TEMPLATE_URL: https://github.com/bulula11/android_kernel_xiaomi_sm8250/releases/download/4.19.325-cip135-st19-aptusitu-perf-ge20c2c49c4e6/AnyKernel3_BakaSU_35262_4.19.325-cip135-st19-aptusitu-perf-ge20c2c49c4e6.zip
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Set up Environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        APT_OPTS=(-o Acquire::http::Timeout=25 -o Acquire::https::Timeout=25 -o Acquire::Retries=2 -o Acquire::ForceIPv4=true)
+        for attempt in 1 2 3; do
+          echo "[*] apt-get update (attempt ${attempt})"
+          if sudo timeout 300 apt-get "${APT_OPTS[@]}" update; then break; fi
+          echo "::warning::apt update failed, retrying"
+        done
+        PACKAGES=(
+          bc bison build-essential cpio curl flex git libelf-dev libssl-dev
+          python3 rsync unzip zip
+        )
+        if ! sudo timeout 900 apt-get "${APT_OPTS[@]}" install -y --no-install-recommends "${PACKAGES[@]}"; then
+          echo "::warning::bulk install failed; retrying one by one"
+          for p in "${PACKAGES[@]}"; do
+            sudo timeout 300 apt-get "${APT_OPTS[@]}" install -y --no-install-recommends "$p" || echo "::warning::$p unavailable"
+          done
+        fi
+        # 交叉 binutils：内核里 objcopy/strip 之类仍会用到 aarch64-linux-gnu- 前缀
+        for p in gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi; do
+          sudo timeout 600 apt-get "${APT_OPTS[@]}" install -y --no-install-recommends "$p" || echo "::warning::$p unavailable"
+        done
+
+    - name: Clone kernel source
+      run: |
+        git clone --depth 1 -b "${{ inputs.branch }}" "$KERNEL_REPO" ksrc
+        cd ksrc
+        echo "[*] HEAD: $(git log -1 --format='%h %ad %s' --date=short)"
+        echo "[*] cip=$(cat localversion-cip) st=$(cat localversion-st)"
+
+    - name: Fetch AOSP clang
+      run: |
+        mkdir -p "$HOME/clang"
+        ok=0
+        for tag in "${{ inputs.clang }}" clang-r574158 clang-r596125; do
+          for ref in mirror-goog-main-llvm-toolchain-source main; do
+            url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/${ref}/${tag}.tar.gz"
+            echo "[*] trying ${tag} (${ref})"
+            if curl -fL --retry 2 --max-time 900 -o /tmp/clang.tar.gz "$url"; then
+              tar -xzf /tmp/clang.tar.gz -C "$HOME/clang" && ok=1 && echo "[+] using ${tag}" && break 2
+            fi
+          done
+        done
+        if [ "$ok" -ne 1 ]; then
+          echo "::error::no AOSP clang archive could be downloaded"
+          exit 1
+        fi
+        "$HOME/clang/bin/clang" --version | head -n 2
+
+    - name: Integrate latest BakaSU
+      run: |
+        cd ksrc
+        curl -LSs --retry 3 -o /tmp/ksu-setup.sh https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh
+        sh /tmp/ksu-setup.sh
+        echo "[*] BakaSU commit: $(git -C KernelSU log -1 --format='%h %ad %s' --date=short)"
+        echo "[*] BakaSU commits: $(git -C KernelSU rev-list --count HEAD)"
+        # 把集成结果提交一次，避免 setlocalversion 追加 -dirty，版本串更干净
+        git -c user.email=ci@local -c user.name=ci add -A
+        git -c user.email=ci@local -c user.name=ci commit -q -m "integrate BakaSU $(git -C KernelSU rev-parse --short HEAD)" || true
+
+    - name: Configure (cas)
+      run: |
+        cd ksrc
+        # 这颗树的 localversion 文件写着 -RvKernel-Alioth-v2.2，跟目标设备无关，去掉
+        rm -f localversion
+
+        export ARCH=arm64 SUBARCH=arm64
+        make O=out vendor/kona-perf_defconfig
+        cat arch/arm64/configs/vendor/xiaomi/sm8250-common.config >> out/.config
+        cat arch/arm64/configs/vendor/xiaomi/cas.config >> out/.config
+
+        # 4.19 是非 GKI：必须用 manual hook。tracepoint hook 只支持 5.10+ 的 GKI2，
+        # 上一版 35262 两个都没选，等于没有任何 syscall 钩子。
+        # SUSFS 这套树没有打 simonpunk 的内核补丁（fs/susfs.c 不存在），开了会编译失败，
+        # 所以这一版先只上 KernelSU 本体。
+        scripts/config --file out/.config \
+          -e KSU \
+          -d KSU_TRACEPOINT_HOOK \
+          -e KSU_MANUAL_HOOK \
+          -e KSU_MULTI_MANAGER_SUPPORT \
+          -d KSU_SUSFS
+
+        make O=out olddefconfig
+
+        echo "=== 关键配置核对 ==="
+        for s in CONFIG_KSU CONFIG_KSU_MANUAL_HOOK CONFIG_MACH_XIAOMI_CAS \
+                 CONFIG_BACKLIGHT_KTZ8866 CONFIG_BACKLIGHT_DUALKTZ8866 CONFIG_MOTOR_DRV8846 \
+                 CONFIG_HALL_AKM09970 CONFIG_LEDS_AW2015 CONFIG_PS5169 CONFIG_CHARGER_BQ25790 \
+                 CONFIG_FUEL_GAUGE_BQ28Z610 CONFIG_CP_MAX77932 CONFIG_WATCHDOG_MAX28200 \
+                 CONFIG_LTO_CLANG CONFIG_CFI_CLANG CONFIG_LOCALVERSION; do
+          grep -E "^${s}=" out/.config || echo "::warning::${s} is not set"
+        done
+        grep -q '^CONFIG_KSU_MANUAL_HOOK=y' out/.config || { echo "::error::manual hook not selected"; exit 1; }
+        grep -q '^CONFIG_BACKLIGHT_KTZ8866=y' out/.config || { echo "::error::KTZ8866 backlight missing"; exit 1; }
+
+    - name: Build Image
+      run: |
+        cd ksrc
+        export ARCH=arm64 SUBARCH=arm64
+        export PATH="$HOME/clang/bin:$PATH"
+        set -o pipefail
+        make O=out -j"$(nproc)" \
+          CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
+          OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+          KBUILD_BUILD_USER=builder KBUILD_BUILD_HOST=ci \
+          Image 2>&1 | tee build.log
+        ls -la out/arch/arm64/boot/Image
+
+    - name: Upload build log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-log-${{ inputs.branch }}
+        path: ksrc/build.log
+        if-no-files-found: warn
+
+    - name: Package AnyKernel3
+      id: pack
+      run: |
+        set -euo pipefail
+        cd ksrc
+        REL=$(cat out/include/config/kernel.release)
+        echo "[*] kernel release: ${REL}"
+        CODE=$(grep -rhoE -- '-DKSU_VERSION=[0-9]+' out 2>/dev/null | head -n1 | cut -d= -f2 || true)
+        if [ -z "${CODE}" ]; then
+          CODE=$((30000 + $(git -C KernelSU rev-list --count HEAD) + 700))
+          echo "[!] fallback version code: ${CODE}"
+        fi
+        echo "[*] BakaSU version code: ${CODE}"
+
+        curl -fL --retry 3 --max-time 600 -o /tmp/ak3.zip "${AK3_TEMPLATE_URL}"
+        rm -rf ak3 && mkdir -p ak3 && unzip -q /tmp/ak3.zip -d ak3
+        cp out/arch/arm64/boot/Image ak3/kernels/Image
+        sed -i "s|^kernel.string=.*|kernel.string=BakaSU cas ${REL} (CloverProject base)|" ak3/anykernel.sh
+
+        ZIP="AnyKernel3_BakaSU_${CODE}_${REL}.zip"
+        ( cd ak3 && zip -r9 "../${ZIP}" . > /dev/null )
+        ls -la "${ZIP}"
+        echo "zip=${ZIP}" >> "$GITHUB_OUTPUT"
+        echo "code=${CODE}" >> "$GITHUB_OUTPUT"
+        echo "rel=${REL}" >> "$GITHUB_OUTPUT"
+
+    - name: Upload Flashable ZIP
+      uses: actions/upload-artifact@v7
+      with:
+        path: ksrc/AnyKernel3_*.zip
+        archive: false
+        if-no-files-found: error
+
+    - name: Publish Release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        ZIP="${{ steps.pack.outputs.zip }}"
+        REL="${{ steps.pack.outputs.rel }}"
+        CODE="${{ steps.pack.outputs.code }}"
+        NOTES=$(printf 'AnyKernel3 刷机包（BakaSU %s，KernelSU 模式，未含 SUSFS）。\n\n- 基座：Rve27/android_kernel_xiaomi_sm8250 @ %s（%s）\n- 配置：vendor/kona-perf_defconfig + vendor/xiaomi/sm8250-common.config + vendor/xiaomi/cas.config\n- 目标：小米 10 至尊纪念版（cas），配置与 CloverProject-4.1 可用内核一致（含 KTZ8866 双路背光 / DC 调光）\n- 编译：AOSP clang %s\n- 构建提交：%s\n' \
+          "${CODE}" "${{ inputs.branch }}" "${REL}" "${{ inputs.clang }}" "${GITHUB_SHA}")
+        if gh release view "${REL}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+          gh release upload "${REL}" "ksrc/${ZIP}" --repo "${GITHUB_REPOSITORY}" --clobber
+          gh release edit "${REL}" --repo "${GITHUB_REPOSITORY}" --notes "${NOTES}"
+        else
+          gh release create "${REL}" "ksrc/${ZIP}" --repo "${GITHUB_REPOSITORY}" \
+            --title "${ZIP}" --notes "${NOTES}" --target "${GITHUB_SHA}" --latest
+        fi
+        gh release view "${REL}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name'
