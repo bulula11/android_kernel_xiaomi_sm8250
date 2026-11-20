@@ -406,6 +406,24 @@ build_target() {
             -e REKERNEL_NETWORK
     fi
 
+    # 4b. cas (Mi 10 Ultra) on-device drivers
+    # cas_defconfig in this tree is a trimmed AOSP reference config: it leaves
+    # every Mi 10 Ultra peripheral driver disabled, so the resulting Image
+    # boots with no backlight, no vibration motor, no hall sensor and no RGB
+    # LED.  BACKLIGHT_KTZ8866 is also the piece that implements DC dimming
+    # (the driver parks the PWM dimming path and drives the backlight IC
+    # current directly), so DC dimming is unavailable without it.
+    if [ "$OS_TYPE" == "aosp" ]; then
+        echo "[*] Injecting Mi 10 Ultra (cas) peripheral drivers..."
+        scripts/config --file "${OUT_DIR}/.config" \
+            -e BACKLIGHT_KTZ8866 \
+            -e BACKLIGHT_DUALKTZ8866 \
+            -e LEDS_AW2015 \
+            -e HALL_AKM09970 \
+            -e MOTOR_DRV8846 \
+            -e PS5169
+    fi
+
     # We always need to re-evaluate dependencies because BBG is injected unconditionally
     echo "[*] Updating config (make olddefconfig)..."
     make "${MAKE_OPTS[@]}" olddefconfig
@@ -419,6 +437,25 @@ build_target() {
         echo "[!] CONFIG_BBG is not set after olddefconfig."
         echo "[!] The Baseband-guard setup or its security/Kconfig patch did not apply."
         exit 1
+    fi
+
+    # The cas peripheral drivers live in Kconfig menus that the trimmed
+    # defconfig does not reach, and scripts/config happily appends symbols the
+    # Kconfig tree has never heard of.  olddefconfig silently drops those, so
+    # without this check a build can finish and ship an Image whose backlight
+    # (and therefore DC dimming) never probes.
+    if [ "$OS_TYPE" == "aosp" ]; then
+        CAS_MISSING=""
+        for sym in BACKLIGHT_KTZ8866 BACKLIGHT_DUALKTZ8866 LEDS_AW2015 \
+                   HALL_AKM09970 MOTOR_DRV8846 PS5169; do
+            grep -qx "CONFIG_${sym}=y" "${OUT_DIR}/.config" || CAS_MISSING="${CAS_MISSING} ${sym}"
+        done
+        if [ -n "${CAS_MISSING}" ]; then
+            echo "[!] These cas drivers did not survive olddefconfig:${CAS_MISSING}"
+            echo "[!] Their Kconfig dependencies are not met by the AOSP config."
+            exit 1
+        fi
+        echo "[+] All cas peripheral drivers are enabled in .config"
     fi
 
     # ----------------------------------------------------
