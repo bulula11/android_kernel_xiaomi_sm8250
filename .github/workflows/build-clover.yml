@@ -125,6 +125,15 @@ jobs:
         # 这颗树的 localversion 文件写着 -RvKernel-Alioth-v2.2，跟目标设备无关，去掉
         rm -f localversion
 
+        # Makefile 给全树强制加了 -mllvm -polly（KBUILD_CFLAGS / KBUILD_LDFLAGS）。
+        # clang 22 的 Polly 在 qcacld 的 reg_compute_pdev_current_chan_list 上会触发
+        # ISL 断言（Assertion "!is_error()" failed），LTO 阶段直接 abort。
+        # Polly 只是可选循环优化，去掉不影响功能与优化等级（仍是 -O3）。
+        # 只改这两行，保留 CONFIG_LLVM_POLLY 段里的 -polly-* 细节参数。
+        sed -i '/KBUILD_CFLAGS   += -O3 -march=armv8.2-a+lse/s/ -mllvm -polly//' Makefile
+        sed -i '/KBUILD_LDFLAGS  += -O3,-Bsymbolic-functions/s/ -mllvm -polly//' Makefile
+        grep -n 'KBUILD_CFLAGS   += -O3\|KBUILD_LDFLAGS  += -O3' Makefile
+
         export ARCH=arm64 SUBARCH=arm64
         make O=out vendor/kona-perf_defconfig
         cat arch/arm64/configs/vendor/xiaomi/sm8250-common.config >> out/.config
