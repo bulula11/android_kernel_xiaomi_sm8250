@@ -35,6 +35,11 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+    - name: Checkout helper scripts
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+
     - name: Set up Environment
       env:
         DEBIAN_FRONTEND: noninteractive
@@ -97,6 +102,23 @@ jobs:
         git -c user.email=ci@local -c user.name=ci add -A
         git -c user.email=ci@local -c user.name=ci commit -q -m "integrate BakaSU $(git -C KernelSU rev-parse --short HEAD)" || true
 
+    - name: Patch BakaSU manual hooks
+      run: |
+        # setup.sh 只接线 drivers/Kconfig 和 Makefile；非 GKI 内核还必须在
+        # fs/exec.c、fs/open.c、fs/stat.c、kernel/reboot.c 里手动插入钩子，
+        # 否则 drivers/kernelsu 编译时会直接 Stop。
+        python3 ci/patch_ksu_hooks.py ksrc
+        echo "=== 钩子核对 ==="
+        grep -q 'ksu_handle_execveat' ksrc/fs/exec.c && echo "  execveat OK"
+        grep -q 'ksu_handle_faccessat' ksrc/fs/open.c && echo "  faccessat OK"
+        grep -q 'ksu_handle_stat' ksrc/fs/stat.c && echo "  stat OK"
+        grep -q 'ksu_handle_newfstat_ret' ksrc/fs/stat.c && echo "  newfstat_ret OK"
+        grep -q 'ksu_handle_fstat64_ret' ksrc/fs/stat.c && echo "  fstat64_ret OK"
+        grep -q 'ksu_handle_sys_reboot' ksrc/kernel/reboot.c && echo "  sys_reboot OK"
+        cd ksrc
+        git -c user.email=ci@local -c user.name=ci add -A
+        git -c user.email=ci@local -c user.name=ci commit -q -m "add BakaSU manual hooks" || true
+
     - name: Configure (cas)
       run: |
         cd ksrc
@@ -117,7 +139,8 @@ jobs:
           -d KSU_TRACEPOINT_HOOK \
           -e KSU_MANUAL_HOOK \
           -e KSU_MULTI_MANAGER_SUPPORT \
-          -d KSU_SUSFS
+          -d KSU_SUSFS \
+          -e KALLSYMS_ALL
 
         make O=out olddefconfig
 
@@ -126,7 +149,7 @@ jobs:
                  CONFIG_BACKLIGHT_KTZ8866 CONFIG_BACKLIGHT_DUALKTZ8866 CONFIG_MOTOR_DRV8846 \
                  CONFIG_HALL_AKM09970 CONFIG_LEDS_AW2015 CONFIG_PS5169 CONFIG_CHARGER_BQ25790 \
                  CONFIG_FUEL_GAUGE_BQ28Z610 CONFIG_CP_MAX77932 CONFIG_WATCHDOG_MAX28200 \
-                 CONFIG_LTO_CLANG CONFIG_CFI_CLANG CONFIG_LOCALVERSION; do
+                 CONFIG_LTO_CLANG CONFIG_CFI_CLANG CONFIG_LOCALVERSION CONFIG_KALLSYMS_ALL; do
           grep -E "^${s}=" out/.config || echo "::warning::${s} is not set"
         done
         grep -q '^CONFIG_KSU_MANUAL_HOOK=y' out/.config || { echo "::error::manual hook not selected"; exit 1; }
