@@ -130,6 +130,17 @@ jobs:
         git -c user.email=ci@local -c user.name=ci add -A
         git -c user.email=ci@local -c user.name=ci commit -q -m "add BakaSU SUSFS inline hooks" || true
 
+    - name: Enable full-range DC dimming
+      run: |
+        # ROM 的 DC 开关只写 msm_fb_ea_enable -> 原来只做低亮度 PCC 缩放，
+        # 面板始终是 PWM。这里让它同时切面板 DDIC 的硬件 DC 模式（DISPPARAM_DC_ON
+        # 对应的 DSI_CMD_SET_MI_DC_ON），和 MIUI「防闪烁模式」一致，全亮度都是 DC。
+        python3 ci/patch_dc_fullrange.py ksrc
+        cd ksrc
+        grep -n "full-range dc dimming" techpack/display/msm/dsi/exposure_adjustment.c
+        git -c user.email=ci@local -c user.name=ci add -A
+        git -c user.email=ci@local -c user.name=ci commit -q -m "display: full-range DC dimming (panel DC mode)" || true
+
     - name: Configure (cas)
       run: |
         cd ksrc
