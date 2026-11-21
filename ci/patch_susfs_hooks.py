@@ -282,6 +282,18 @@ def patch_input(root):
 
 # ---------------------------------------------------------------- fs/stat.c
 def patch_stat(root):
+    # filename_lookup() 的声明只在 fs/internal.h 里（不是公开头文件），
+    # 不加这个 include 会 -Werror=implicit-function-declaration 直接编译失败
+    sub(root, "fs/stat.c",
+        "#include <linux/compat.h>\n"
+        "\n"
+        "#include <linux/uaccess.h>\n",
+        "#include <linux/compat.h>\n"
+        "#include \"internal.h\"\n"
+        "\n"
+        "#include <linux/uaccess.h>\n",
+        "stat.c internal.h", "#include \"internal.h\"")
+
     sub(root, "fs/stat.c",
         "#include <asm/unistd.h>\n\n"
         "#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n",
