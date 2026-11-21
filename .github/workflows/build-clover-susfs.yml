@@ -140,6 +140,11 @@ jobs:
         sed -i '/KBUILD_LDFLAGS  += -O3,-Bsymbolic-functions/s/ -mllvm -polly//' Makefile
         grep -n 'KBUILD_CFLAGS   += -O3\|KBUILD_LDFLAGS  += -O3' Makefile
 
+        # 先把源码改动提交，保证 setlocalversion 算出的版本号不带 -dirty
+        # （必须赶在 make O=out 建出 out/ 之前，避免把编译目录塞进提交）
+        git -c user.email=ci@local -c user.name=ci add -A
+        git -c user.email=ci@local -c user.name=ci commit -q -m "cas: drop localversion, remove polly" || true
+
         export ARCH=arm64 SUBARCH=arm64
         make O=out vendor/kona-perf_defconfig
         cat arch/arm64/configs/vendor/xiaomi/sm8250-common.config >> out/.config
@@ -182,10 +187,6 @@ jobs:
         grep -q '^CONFIG_KSU_MANUAL_HOOK=y' out/.config && { echo "::error::manual hook 与 SUSFS 互斥，不应同时开启"; exit 1; }
         grep -q '^CONFIG_BACKLIGHT_KTZ8866=y' out/.config || { echo "::error::KTZ8866 backlight missing"; exit 1; }
         grep -q '^CONFIG_THREAD_INFO_IN_TASK=y' out/.config || { echo "::error::THREAD_INFO_IN_TASK missing (KSU_SUSFS depends on it)"; exit 1; }
-
-        # 提交配置阶段的改动（删 localversion、去 polly），避免版本号带 -dirty
-        git -c user.email=ci@local -c user.name=ci add -A
-        git -c user.email=ci@local -c user.name=ci commit -q -m "cas: aosp config + SUSFS" || true
 
     - name: Build Image
       run: |
