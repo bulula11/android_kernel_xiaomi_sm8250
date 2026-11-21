@@ -1,0 +1,248 @@
+name: Build BakaSU cas + SUSFS (CloverProject base)
+
+# 在上一版（build-clover.yml）基础上加 SUSFS：
+#   基座 Rve27@lineage-23.2（4.19.325-cip136-st20，含 KTZ8866 双路背光/DC 调光）
+#   + 最新 BakaSU + SUSFS v2.3.0（与用户原本能用的那个 AK3 同版本）
+#
+# 注意：BakaSU 的 Kconfig 里 KSU_TRACEPOINT_HOOK / KSU_MANUAL_HOOK / KSU_SUSFS
+# 是同一个 choice，开了 KSU_SUSFS 就变成 "SUSFS Inline Hook"，手动钩子那套
+# （ksu_handle_newfstat_ret 等）不再适用，需要的是另一组 ksu_handle_* 调用点，
+# 由 ci/patch_susfs_hooks.py 注入。
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Kernel branch (Rve27/android_kernel_xiaomi_sm8250)'
+        default: 'lineage-23.2'
+        required: false
+      clang:
+        description: 'AOSP clang tag'
+        default: 'clang-r574158'
+        required: false
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: clover-bakasu-susfs
+  cancel-in-progress: false
+
+env:
+  KERNEL_REPO: https://github.com/Rve27/android_kernel_xiaomi_sm8250.git
+  # 只借它的 AnyKernel3 外壳（cas 的分区路径、A/B 槽位处理）
+  AK3_TEMPLATE_URL: https://github.com/bulula11/android_kernel_xiaomi_sm8250/releases/download/4.19.325-cip135-st19-aptusitu-perf-ge20c2c49c4e6/AnyKernel3_BakaSU_35262_4.19.325-cip135-st19-aptusitu-perf-ge20c2c49c4e6.zip
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Checkout helper scripts
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+
+    - name: Set up Environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        APT_OPTS=(-o Acquire::http::Timeout=25 -o Acquire::https::Timeout=25 -o Acquire::Retries=2 -o Acquire::ForceIPv4=true)
+        for attempt in 1 2 3; do
+          echo "[*] apt-get update (attempt ${attempt})"
+          if sudo timeout 300 apt-get "${APT_OPTS[@]}" update; then break; fi
+          echo "::warning::apt update failed, retrying"
+        done
+        PACKAGES=(
+          bc bison build-essential cpio curl flex git libelf-dev libssl-dev
+          patch python3 rsync unzip zip
+        )
+        if ! sudo timeout 900 apt-get "${APT_OPTS[@]}" install -y --no-install-recommends "${PACKAGES[@]}"; then
+          echo "::warning::bulk install failed; retrying one by one"
+          for p in "${PACKAGES[@]}"; do
+            sudo timeout 300 apt-get "${APT_OPTS[@]}" install -y --no-install-recommends "$p" || echo "::warning::$p unavailable"
+          done
+        fi
+        for p in gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi; do
+          sudo timeout 600 apt-get "${APT_OPTS[@]}" install -y --no-install-recommends "$p" || echo "::warning::$p unavailable"
+        done
+
+    - name: Clone kernel source
+      run: |
+        git clone --depth 1 -b "${{ inputs.branch }}" "$KERNEL_REPO" ksrc
+        cd ksrc
+        echo "[*] HEAD: $(git log -1 --format='%h %ad %s' --date=short)"
+        echo "[*] cip=$(cat localversion-cip) st=$(cat localversion-st)"
+
+    - name: Apply SUSFS v2.3.0
+      run: |
+        cd ksrc
+        # 来源：9Qie/android_kernel_xiaomi_sm8250 的 "fs: Integrate SuSFS v2.3.0"
+        # 这是 4.19.325 上实测可用的 SUSFS 移植（用户在用的那个 AK3 就是 v2.3.0）
+        patch -p1 --forward -F3 < ../ci/susfs_v230.patch | tail -20
+        for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
+          [ -s "$f" ] || { echo "::error::SUSFS 文件缺失 $f"; exit 1; }
+        done
+        grep -m1 '^#define SUSFS_VERSION' include/linux/susfs.h
+        # 补丁只能落在干净的 fs/* 上，出现 .rej 就必须停下
+        if find . -name '*.rej' | grep -q .; then
+          echo "::error::SUSFS 补丁有 rej 块"
+          find . -name '*.rej' -exec cat {} \;
+          exit 1
+        fi
+
+    - name: Integrate latest BakaSU
+      run: |
+        cd ksrc
+        curl -LSs --retry 3 -o /tmp/ksu-setup.sh https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh
+        sh /tmp/ksu-setup.sh
+        echo "[*] BakaSU commit: $(git -C KernelSU log -1 --format='%h %ad %s' --date=short)"
+        echo "[*] BakaSU commits: $(git -C KernelSU rev-list --count HEAD)"
+        git -c user.email=ci@local -c user.name=ci add -A
+        git -c user.email=ci@local -c user.name=ci commit -q -m "integrate BakaSU $(git -C KernelSU rev-parse --short HEAD) + SUSFS v2.3.0" || true
+
+    - name: Patch BakaSU SUSFS inline hooks
+      run: |
+        # KSU_SUSFS 模式下 BakaSU 用 inline hook，tools/inline_hook_check.mk 会检查
+        # 8 处 ksu_handle_* 调用点，缺一个就 Stop。这里按已验证的组合注入。
+        python3 ci/patch_susfs_hooks.py ksrc
+        cd ksrc
+        git -c user.email=ci@local -c user.name=ci add -A
+        git -c user.email=ci@local -c user.name=ci commit -q -m "add BakaSU SUSFS inline hooks" || true
+
+    - name: Configure (cas)
+      run: |
+        cd ksrc
+        rm -f localversion
+
+        # Makefile 给全树强制加了 -mllvm -polly，clang 22 在 qcacld 上会触发 ISL 断言
+        sed -i '/KBUILD_CFLAGS   += -O3 -march=armv8.2-a+lse/s/ -mllvm -polly//' Makefile
+        sed -i '/KBUILD_LDFLAGS  += -O3,-Bsymbolic-functions/s/ -mllvm -polly//' Makefile
+        grep -n 'KBUILD_CFLAGS   += -O3\|KBUILD_LDFLAGS  += -O3' Makefile
+
+        export ARCH=arm64 SUBARCH=arm64
+        make O=out vendor/kona-perf_defconfig
+        cat arch/arm64/configs/vendor/xiaomi/sm8250-common.config >> out/.config
+        cat arch/arm64/configs/vendor/xiaomi/cas.config >> out/.config
+
+        # KSU_SUSFS 与 KSU_MANUAL_HOOK / KSU_TRACEPOINT_HOOK 互斥（同一个 choice），
+        # 开 SUSFS 就自动切到 SUSFS inline hook 模式。
+        scripts/config --file out/.config \
+          -e KSU \
+          -d KSU_TRACEPOINT_HOOK \
+          -d KSU_MANUAL_HOOK \
+          -e KSU_MULTI_MANAGER_SUPPORT \
+          -e KSU_SUSFS \
+          -e KSU_SUSFS_SUS_PATH \
+          -e KSU_SUSFS_SUS_MOUNT \
+          -e KSU_SUSFS_SUS_KSTAT \
+          -e KSU_SUSFS_SPOOF_UNAME \
+          -e KSU_SUSFS_ENABLE_LOG \
+          -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+          -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+          -e KSU_SUSFS_OPEN_REDIRECT \
+          -e KSU_SUSFS_SUS_MAP \
+          -e KALLSYMS_ALL
+
+        make O=out olddefconfig
+
+        echo "=== 关键配置核对 ==="
+        for s in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_PATH CONFIG_KSU_SUSFS_SUS_MOUNT \
+                 CONFIG_KSU_SUSFS_SUS_KSTAT CONFIG_KSU_SUSFS_SPOOF_UNAME CONFIG_KSU_SUSFS_ENABLE_LOG \
+                 CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+                 CONFIG_KSU_SUSFS_OPEN_REDIRECT CONFIG_KSU_SUSFS_SUS_MAP \
+                 CONFIG_MACH_XIAOMI_CAS CONFIG_BACKLIGHT_KTZ8866 CONFIG_BACKLIGHT_DUALKTZ8866 \
+                 CONFIG_MOTOR_DRV8846 CONFIG_HALL_AKM09970 CONFIG_LEDS_AW2015 CONFIG_PS5169 \
+                 CONFIG_CHARGER_BQ25790 CONFIG_FUEL_GAUGE_BQ28Z610 CONFIG_CP_MAX77932 \
+                 CONFIG_WATCHDOG_MAX28200 CONFIG_THREAD_INFO_IN_TASK \
+                 CONFIG_LTO_CLANG CONFIG_CFI_CLANG CONFIG_KALLSYMS_ALL; do
+          grep -E "^${s}=" out/.config || echo "::warning::${s} is not set"
+        done
+        grep -q '^CONFIG_KSU_SUSFS=y' out/.config || { echo "::error::CONFIG_KSU_SUSFS not selected"; exit 1; }
+        grep -q '^CONFIG_KSU_MANUAL_HOOK=y' out/.config && { echo "::error::manual hook 与 SUSFS 互斥，不应同时开启"; exit 1; }
+        grep -q '^CONFIG_BACKLIGHT_KTZ8866=y' out/.config || { echo "::error::KTZ8866 backlight missing"; exit 1; }
+        grep -q '^CONFIG_THREAD_INFO_IN_TASK=y' out/.config || { echo "::error::THREAD_INFO_IN_TASK missing (KSU_SUSFS depends on it)"; exit 1; }
+
+        # 提交配置阶段的改动（删 localversion、去 polly），避免版本号带 -dirty
+        git -c user.email=ci@local -c user.name=ci add -A
+        git -c user.email=ci@local -c user.name=ci commit -q -m "cas: aosp config + SUSFS" || true
+
+    - name: Build Image
+      run: |
+        cd ksrc
+        export ARCH=arm64 SUBARCH=arm64
+        export PATH="$HOME/clang/bin:$PATH"
+        set -o pipefail
+        make O=out -j"$(nproc)" \
+          CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
+          OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+          KBUILD_BUILD_USER=builder KBUILD_BUILD_HOST=ci \
+          Image 2>&1 | tee build.log
+        ls -la out/arch/arm64/boot/Image
+        echo "=== SUSFS 目标文件 ==="
+        ls -la out/fs/susfs.o
+        grep -m1 'SUSFS_VERSION' build.log || true
+        grep -m1 'using SuSFS Inline hook' build.log || { echo "::error::Kbuild 未进入 SUSFS inline hook 分支"; exit 1; }
+
+    - name: Upload build log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-log-susfs-${{ inputs.branch }}
+        path: ksrc/build.log
+        if-no-files-found: warn
+
+    - name: Package AnyKernel3
+      id: pack
+      run: |
+        set -euo pipefail
+        cd ksrc
+        REL=$(cat out/include/config/kernel.release)
+        echo "[*] kernel release: ${REL}"
+        CODE=$(grep -rhoE -- '-DKSU_VERSION=[0-9]+' out 2>/dev/null | head -n1 | cut -d= -f2 || true)
+        if [ -z "${CODE}" ]; then
+          CODE=$((30000 + $(git -C KernelSU rev-list --count HEAD) + 700))
+          echo "[!] fallback version code: ${CODE}"
+        fi
+        echo "[*] BakaSU version code: ${CODE}"
+
+        curl -fL --retry 3 --max-time 600 -o /tmp/ak3.zip "${AK3_TEMPLATE_URL}"
+        rm -rf ak3 && mkdir -p ak3 && unzip -q /tmp/ak3.zip -d ak3
+        cp out/arch/arm64/boot/Image ak3/kernels/Image
+        sed -i "s|^kernel.string=.*|kernel.string=BakaSU cas ${REL} + SUSFS v2.3.0 (CloverProject base)|" ak3/anykernel.sh
+
+        ZIP="AnyKernel3_BakaSU_${CODE}_SUSFS_${REL}.zip"
+        ( cd ak3 && zip -r9 "../${ZIP}" . > /dev/null )
+        ls -la "${ZIP}"
+        echo "zip=${ZIP}" >> "$GITHUB_OUTPUT"
+        echo "code=${CODE}" >> "$GITHUB_OUTPUT"
+        echo "rel=${REL}" >> "$GITHUB_OUTPUT"
+
+    - name: Upload Flashable ZIP
+      uses: actions/upload-artifact@v7
+      with:
+        path: ksrc/AnyKernel3_*.zip
+        archive: false
+        if-no-files-found: error
+
+    - name: Publish Release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        ZIP="${{ steps.pack.outputs.zip }}"
+        REL="${{ steps.pack.outputs.rel }}"
+        CODE="${{ steps.pack.outputs.code }}"
+        NOTES=$(printf 'AnyKernel3 刷机包（BakaSU %s + SUSFS v2.3.0，SUSFS Inline Hook 模式）。\n\n- 基座：Rve27/android_kernel_xiaomi_sm8250 @ %s（%s）\n- 配置：vendor/kona-perf_defconfig + vendor/xiaomi/sm8250-common.config + vendor/xiaomi/cas.config\n- 目标：小米 10 至尊纪念版（cas），含 KTZ8866 双路背光 / DC 调光\n- SUSFS：v2.3.0（sus_path / sus_mount / sus_kstat / spoof_uname / open_redirect / sus_map 全开）\n- 编译：AOSP clang %s\n- 构建提交：%s\n' \
+          "${CODE}" "${{ inputs.branch }}" "${REL}" "${{ inputs.clang }}" "${GITHUB_SHA}")
+        if gh release view "${REL}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+          gh release upload "${REL}" "ksrc/${ZIP}" --repo "${GITHUB_REPOSITORY}" --clobber
+          gh release edit "${REL}" --repo "${GITHUB_REPOSITORY}" --notes "${NOTES}"
+        else
+          gh release create "${REL}" "ksrc/${ZIP}" --repo "${GITHUB_REPOSITORY}" \
+            --title "${ZIP}" --notes "${NOTES}" --target "${GITHUB_SHA}" --latest
+        fi
+        gh release view "${REL}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name'
