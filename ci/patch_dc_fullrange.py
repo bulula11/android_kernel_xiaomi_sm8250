@@ -3,20 +3,23 @@
 
 背景
 ----
-- MIUI 官方内核里没有 exposure_adjustment（EA）这套东西，它的「防闪烁模式」
-  是靠面板 DDIC 的 DC 模式实现的（dsi_panel_mi.c 的 DISPPARAM_DC_ON，
-  对应面板 DTS 的 mi,mdss-dsi-dc-on-command，B2=0xC8），所以整段亮度都是
-  直流调光，不存在「低亮度回落 PWM」。
+- MIUI 官方内核（4.19.157-perf, cas, MIUI14）里没有 exposure_adjustment 这一套，
+  dtbo 里 42 02 0b 面板是 mi,mdss-dsi-panel-dc-type = 0，防闪烁模式只做一件事：
+  下发 mi,mdss-dsi-dc-on-command（F0 55 AA 52 08 00 / B2 C8 / 6F 09 / B2 00 /
+  B3 全零），面板 DDIC 进入硬件 DC 模式，整个亮度区间都是直流调光。
+  实测字节与内核树 dsi-panel-j2-42-02-0b-dsc-cmd.dtsi 完全一致。
 - Lineage/Clover 的 DC 开关只写 msm_fb_ea_enable -> ea_panel_mode_ctrl()，
-  而那段代码只做低亮度 PCC（DSPP）缩放，从来没有把面板切到 DC 模式；
-  被钳到 ELVSS_OFF_THRESHOLD 的 DBV 依旧是面板自己的 PWM，所以亮度一低就闪。
+  那段代码只做低亮度 PCC(DSPP) 缩放，从来没把面板切进 DC 模式；被钳到
+  ELVSS_OFF_THRESHOLD 的 DBV 依旧是面板自己的 PWM，所以亮度一低就闪。
+  而且原实现里亮度升回阈值以上时不会把 PCC 复位，画面会一直偏暗。
 
-改法
+改法（与 MIUI 对齐）
 ----
-1. ea_panel_mode_ctrl() 额外把面板切到硬件 DC 模式（DC ON/OFF 命令集），
-   并同步 dc_enable/dc_type，使每次亮屏后 dsi_panel_enable() 会自动补发，
-   不需要用户再点一次开关。
-2. 保留原有的低亮度 PCC 缩放作为兜底（DC 的低亮端再叠一层像素缩放）。
+1. ea_panel_mode_ctrl() 直接下发 DSI_CMD_SET_MI_DC_ON / OFF（就是
+   DISPPARAM_DC_ON 走的那条命令集），并同步 dc_type/dc_enable，
+   使每次亮屏后 dsi_panel_enable() 自动补发，不用再点一次开关。
+2. ea_panel_calc_backlight() 去掉 PCC 钳位，亮度完整交给面板 DBV，
+   避免低亮度发灰、亮度回不去。
 """
 
 import os
@@ -25,44 +28,57 @@ import sys
 REL = "techpack/display/msm/dsi/exposure_adjustment.c"
 MARK = "[dc] full-range dc dimming"
 
-NEW_FUNC = '''void ea_panel_mode_ctrl(struct dsi_panel *panel, bool enable)
+MODE_FUNC = '''void ea_panel_mode_ctrl(struct dsi_panel *panel, bool enable)
 {
 	if (!panel)
 		return;
 
-	if (pcc_backlight_enable != enable) {
-		pcc_backlight_enable = enable;
+	if (pcc_backlight_enable == enable)
+		return;
 
-		/*
-		 * 全程 DC：msm_fb_ea_enable 在 ROM 里就是「DC 调光」开关。
-		 * 只做低亮度 PCC 缩放是不够的——钳到 ELVSS_OFF_THRESHOLD 的
-		 * DBV 依旧是面板 PWM，所以这里同时把 DDIC 切进硬件 DC 模式。
-		 */
-		panel->mi_cfg.dc_type = 0;
-		panel->mi_cfg.dc_enable = enable;
+	pcc_backlight_enable = enable;
 
-		pr_info("[dc] full-range dc dimming %s, bl %d\\n",
-				enable ? "on" : "off", last_level);
+	/*
+	 * 全程 DC：msm_fb_ea_enable 在 ROM 里就是「DC 调光」开关。
+	 * 只做低亮度 PCC 缩放是不够的——面板本身仍在 PWM，所以这里直接把
+	 * DDIC 切进硬件 DC 模式（与 MIUI 防闪烁模式同一条命令集）。
+	 */
+	panel->mi_cfg.dc_type = 0;
+	panel->mi_cfg.dc_enable = enable;
 
-		mutex_lock(&panel->panel_lock);
-		if (panel->panel_initialized)
-			dsi_panel_tx_cmd_set(panel, enable ?
-					DSI_CMD_SET_MI_DC_ON :
-					DSI_CMD_SET_MI_DC_OFF);
-		mutex_unlock(&panel->panel_lock);
+	pr_info("[dc] full-range dc dimming %s, bl %d\\n",
+			enable ? "on" : "off", last_level);
 
-		dsi_panel_set_backlight(panel, last_level);
-		if (!enable)
-			ea_panel_send_pcc(ELVSS_OFF_THRESHOLD);
-	} else if (last_level == 0 && !pcc_backlight_enable) {
+	mutex_lock(&panel->panel_lock);
+	if (panel->panel_initialized)
+		dsi_panel_tx_cmd_set(panel, enable ?
+				DSI_CMD_SET_MI_DC_ON :
+				DSI_CMD_SET_MI_DC_OFF);
+	mutex_unlock(&panel->panel_lock);
+
+	/* 清掉可能残留的 PCC 缩放，亮度完全由面板 DBV 决定 */
+	if (panel->panel_initialized)
 		ea_panel_send_pcc(ELVSS_OFF_THRESHOLD);
-	}
+}'''
+
+CALC_FUNC = '''u32 ea_panel_calc_backlight(u32 bl_lvl)
+{
+	/* 全程 DC：亮度完整交给面板 DBV，不再用 PCC 缩放兜底 */
+	last_level = bl_lvl;
+
+	return bl_lvl;
 }'''
 
 
 def fail(msg):
     print("::error::" + msg)
     sys.exit(1)
+
+
+def replace_func(src, sig, body):
+    start = src.index(sig)
+    end = src.index("\n}\n", start) + 3
+    return src[:start] + body + "\n" + src[end:]
 
 
 def main():
@@ -73,33 +89,30 @@ def main():
 
     src = open(path, encoding="utf-8").read()
     if MARK in src:
-        print("[*] 已经打过 DC 全程补丁，跳过")
+        print("[*] 已经打过全程 DC 补丁，跳过")
         return 0
 
-    sig = "void ea_panel_mode_ctrl(struct dsi_panel *panel, bool enable)"
     try:
-        start = src.index(sig)
-        end = src.index("\n}\n", start) + 3
+        src = replace_func(src, "void ea_panel_mode_ctrl(struct dsi_panel *panel, bool enable)", MODE_FUNC)
+        src = replace_func(src, "u32 ea_panel_calc_backlight(u32 bl_lvl)", CALC_FUNC)
     except ValueError:
-        fail("ea_panel_mode_ctrl() 结构不符合预期，需要人工确认")
+        fail("exposure_adjustment.c 结构不符合预期，需要人工确认")
 
-    src = src[:start] + NEW_FUNC + "\n" + src[end:]
-
-    # ---- 落地前自检：依赖的符号/字段必须存在 ----
     checks = {
-        "dsi_panel_tx_cmd_set 调用": "dsi_panel_tx_cmd_set(panel, enable ?",
+        "DC ON 命令": "DSI_CMD_SET_MI_DC_ON",
         "dc_enable 同步": "panel->mi_cfg.dc_enable = enable;",
         "dc_type 归零": "panel->mi_cfg.dc_type = 0;",
-        "PCC 兜底保留": "ea_panel_send_pcc(ELVSS_OFF_THRESHOLD);",
+        "PCC 已解除钳位": "return bl_lvl;",
     }
     for name, needle in checks.items():
         if needle not in src:
             fail("补丁自检失败: %s" % name)
+    if "return ELVSS_OFF_THRESHOLD;" in src:
+        fail("补丁自检失败: PCC 钳位没有去掉")
 
     headers = {
         "techpack/display/msm/dsi/dsi_panel.h": [
             "dsi_panel_tx_cmd_set",
-            "dsi_panel_update_backlight",
             "struct dsi_panel_mi_cfg mi_cfg;",
         ],
         "techpack/display/msm/dsi/dsi_defs.h": [
@@ -119,10 +132,9 @@ def main():
     open(path, "w", encoding="utf-8").write(src)
     print("[+] 已注入全程 DC：%s" % REL)
 
-    # 打印改动后的关键片段，便于在 CI 日志里核对
     out = open(path, encoding="utf-8").read()
-    i = out.index(sig)
-    print("\n".join(out[i:i + 1400].splitlines()[:42]))
+    i = out.index("void ea_panel_mode_ctrl")
+    print("\n".join(out[i:i + 1600].splitlines()[:46]))
     return 0
 
 
