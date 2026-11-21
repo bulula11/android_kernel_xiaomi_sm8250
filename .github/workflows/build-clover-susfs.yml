@@ -67,6 +67,26 @@ jobs:
           sudo timeout 600 apt-get "${APT_OPTS[@]}" install -y --no-install-recommends "$p" || echo "::warning::$p unavailable"
         done
 
+    - name: Fetch AOSP clang
+      run: |
+        mkdir -p "$HOME/clang"
+        ok=0
+        for tag in "${{ inputs.clang }}" clang-r574158 clang-r596125; do
+          for ref in mirror-goog-main-llvm-toolchain-source main; do
+            url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/${ref}/${tag}.tar.gz"
+            echo "[*] trying ${tag} (${ref})"
+            if curl -fL --retry 2 --max-time 900 -o /tmp/clang.tar.gz "$url"; then
+              tar -xzf /tmp/clang.tar.gz -C "$HOME/clang" && ok=1 && echo "[+] using ${tag}" && break 2
+            fi
+          done
+        done
+        if [ "$ok" -ne 1 ]; then
+          echo "::error::no AOSP clang archive could be downloaded"
+          exit 1
+        fi
+        "$HOME/clang/bin/clang" --version | head -n 2
+        ls "$HOME/clang/bin/ld.lld"
+
     - name: Clone kernel source
       run: |
         git clone --depth 1 -b "${{ inputs.branch }}" "$KERNEL_REPO" ksrc
